@@ -1,0 +1,359 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Tomcat + JBoss (WildFly) + AWS ALB Deployment
+  - Creates its own VPC, 2 public subnets, Internet Gateway
+  - LinuxServer1: Java 21 + Tomcat 10.1.42 (port 8080)
+  - LinuxServer2: Java 21 + JBoss WildFly (port 9090)
+  - Application Load Balancer routing to both instances
+
+# ─────────────────────────────────────────────
+# PARAMETERS
+# ─────────────────────────────────────────────
+Parameters:
+
+  InstanceType:
+    Type: String
+    Default: t3.micro
+    AllowedValues: [t3.micro, t3.small, t3.medium]
+    Description: EC2 instance type
+
+  KeyPairName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: Name of an existing EC2 Key Pair for SSH access
+
+# ─────────────────────────────────────────────
+# RESOURCES
+# ─────────────────────────────────────────────
+Resources:
+
+  # ── VPC ─────────────────────────────────────
+  TomcatJBossVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: TomcatJBossVPC
+
+  # ── Internet Gateway ─────────────────────────
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: TomcatJBossIGW
+
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref TomcatJBossVPC
+      InternetGatewayId: !Ref InternetGateway
+
+  # ── Public Subnets ───────────────────────────
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref TomcatJBossVPC
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: PublicSubnet1
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref TomcatJBossVPC
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: PublicSubnet2
+
+  # ── Route Table ──────────────────────────────
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref TomcatJBossVPC
+      Tags:
+        - Key: Name
+          Value: PublicRT
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  Subnet1RouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+
+  Subnet2RouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet2
+      RouteTableId: !Ref PublicRouteTable
+
+  # ── Security Group: ALB ────────────────────
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow HTTP from internet to ALB
+      VpcId: !Ref TomcatJBossVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: Public HTTP
+      Tags:
+        - Key: Name
+          Value: TomcatJBoss-ALB-SG
+
+  # ── Security Group: EC2 ────────────────────
+  EC2SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow Tomcat 8080, JBoss 9090, SSH
+      VpcId: !Ref TomcatJBossVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+          Description: Tomcat from ALB
+        - IpProtocol: tcp
+          FromPort: 9090
+          ToPort: 9090
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+          Description: JBoss from ALB
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+          Description: SSH access
+      Tags:
+        - Key: Name
+          Value: TomcatJBoss-EC2-SG
+
+  # ── IAM Role ────────────────────────────────
+  EC2InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Tags:
+        - Key: Name
+          Value: TomcatJBossEC2Role
+
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref EC2InstanceRole
+
+  # ── LinuxServer1: Tomcat (port 8080) ────────
+  LinuxServer1:
+    Type: AWS::EC2::Instance
+    DependsOn: AttachGateway
+    Properties:
+      ImageId: '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64}}'
+      InstanceType: !Ref InstanceType
+      KeyName: !Ref KeyPairName
+      SubnetId: !Ref PublicSubnet1
+      SecurityGroupIds:
+        - !Ref EC2SecurityGroup
+      IamInstanceProfile: !Ref EC2InstanceProfile
+      Tags:
+        - Key: Name
+          Value: LinuxServer1-Tomcat
+      UserData:
+        Fn::Base64: |
+          #!/bin/bash
+          set -e
+          exec > /var/log/userdata.log 2>&1
+
+          # Step 1: Set hostname
+          hostnamectl set-hostname LinuxServer1-Tomcat
+
+          # Step 2: Update system
+          yum update -y
+
+          # Step 3: Install Java 21
+          yum install -y java-21-amazon-corretto
+          java -version
+
+          # Step 4: Install Tomcat 10.1.42
+          cd /opt
+          wget -q https://dlcdn.apache.org/tomcat/tomcat-10/v10.1.42/bin/apache-tomcat-10.1.42.tar.gz
+          tar -xzf apache-tomcat-10.1.42.tar.gz
+          mv apache-tomcat-10.1.42 tomcat
+
+          # Step 5: Start Tomcat on port 8080
+          cd /opt/tomcat/bin
+          chmod +x *.sh
+          ./startup.sh
+
+          echo "Tomcat started on port 8080"
+
+  # ── LinuxServer2: JBoss WildFly (port 9090) ─
+  LinuxServer2:
+    Type: AWS::EC2::Instance
+    DependsOn: AttachGateway
+    Properties:
+      ImageId: '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64}}'
+      InstanceType: !Ref InstanceType
+      KeyName: !Ref KeyPairName
+      SubnetId: !Ref PublicSubnet2
+      SecurityGroupIds:
+        - !Ref EC2SecurityGroup
+      IamInstanceProfile: !Ref EC2InstanceProfile
+      Tags:
+        - Key: Name
+          Value: LinuxServer2-JBoss
+      UserData:
+        Fn::Base64: |
+          #!/bin/bash
+          set -e
+          exec > /var/log/userdata.log 2>&1
+
+          # Step 1: Set hostname
+          hostnamectl set-hostname LinuxServer2-JBoss
+
+          # Step 2: Update system
+          yum update -y
+
+          # Step 3: Install Java 21
+          yum install -y java-21-amazon-corretto
+          java -version
+
+          # Step 4: Download and install WildFly (JBoss) 32.0.0
+          cd /opt
+          wget -q https://github.com/wildfly/wildfly/releases/download/32.0.0.Final/wildfly-32.0.0.Final.tar.gz
+          tar -xzf wildfly-32.0.0.Final.tar.gz
+          mv wildfly-32.0.0.Final jboss
+
+          # Step 5: Configure JBoss to run on port 9090 instead of 8080
+          sed -i 's/<socket-binding name="http" port="\${jboss.http.port:8080}"\/>/<socket-binding name="http" port="\${jboss.http.port:9090}"\/>/g' \
+            /opt/jboss/standalone/configuration/standalone.xml
+
+          # Step 6: Start JBoss in standalone mode (background)
+          /opt/jboss/bin/standalone.sh -b 0.0.0.0 &
+
+          echo "JBoss WildFly started on port 9090"
+
+  # ── Target Group: Tomcat (port 8080) ────────
+  TomcatTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: Tomcat-Target-Group
+      VpcId: !Ref TomcatJBossVPC
+      Protocol: HTTP
+      Port: 8080
+      TargetType: instance
+      HealthCheckProtocol: HTTP
+      HealthCheckPath: /
+      HealthCheckPort: '8080'
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Targets:
+        - Id: !Ref LinuxServer1
+          Port: 8080
+      Tags:
+        - Key: Name
+          Value: Tomcat-Target-Group
+
+  # ── Target Group: JBoss (port 9090) ─────────
+  JBossTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: JBoss-Target-Group
+      VpcId: !Ref TomcatJBossVPC
+      Protocol: HTTP
+      Port: 9090
+      TargetType: instance
+      HealthCheckProtocol: HTTP
+      HealthCheckPath: /
+      HealthCheckPort: '9090'
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Targets:
+        - Id: !Ref LinuxServer2
+          Port: 9090
+      Tags:
+        - Key: Name
+          Value: JBoss-Target-Group
+
+  # ── Application Load Balancer ───────────────
+  ApplicationLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: Tomcat-JBoss-ALB
+      Type: application
+      Scheme: internet-facing
+      SecurityGroups:
+        - !Ref ALBSecurityGroup
+      Subnets:
+        - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+      Tags:
+        - Key: Name
+          Value: Tomcat-JBoss-ALB
+
+  # ── ALB Listener: HTTP:80 ───────────────────
+  # Default → Tomcat; /jboss* path → JBoss
+  ALBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Protocol: HTTP
+      Port: 80
+      DefaultActions:
+        - Type: forward
+          ForwardConfig:
+            TargetGroups:
+              - TargetGroupArn: !Ref TomcatTargetGroup
+                Weight: 1
+              - TargetGroupArn: !Ref JBossTargetGroup
+                Weight: 1
+
+# ─────────────────────────────────────────────
+# OUTPUTS
+# ─────────────────────────────────────────────
+Outputs:
+
+  ALBDNSName:
+    Description: ALB URL - load balances between Tomcat and JBoss
+    Value: !Sub "http://${ApplicationLoadBalancer.DNSName}"
+
+  LinuxServer1TomcatId:
+    Description: LinuxServer1 (Tomcat) Instance ID
+    Value: !Ref LinuxServer1
+
+  LinuxServer2JBossId:
+    Description: LinuxServer2 (JBoss) Instance ID
+    Value: !Ref LinuxServer2
+
+  VPCId:
+    Description: VPC created by this stack
+    Value: !Ref TomcatJBossVPC
