@@ -24,7 +24,7 @@ sudo yum update -y
 ## Step 2 — Install Java 21
 
 ```bash
-sudo yum install -y java-21-amazon-corretto
+sudo yum install java-21-openjdk java-21-openjdk-devel -y
 java -version
 ```
 
@@ -82,7 +82,7 @@ Tomcat started.
 
 ```bash
 # Check the process
-ps aux | grep tomcat
+ps -ef | grep tomcat
 
 # Check port 8080 is listening
 ss -tlnp | grep 8080
