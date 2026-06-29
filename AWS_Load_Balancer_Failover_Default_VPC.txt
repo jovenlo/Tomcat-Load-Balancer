@@ -1,0 +1,281 @@
+Architecture
+
+                     Internet
+                         |
+          Application Load Balancer (ALB)
+                         |
+              -------------------------
+              |                       |
+         EC2 Instance 1         EC2 Instance 2
+         Amazon Linux           Amazon Linux
+         Apache + Tomcat        Apache + Tomcat
+              |                       |
+          Apache (80)            Apache (80)
+              |                       |
+        Proxy to Tomcat      Proxy to Tomcat
+          localhost:8080      localhost:8080
+
+------------------------------------------------------------------------
+
+Step 1: Launch EC2 Instance 1
+
+1.  Go to AWS Console → EC2.
+2.  Click Launch Instance.
+3.  Name: Linux-1.
+4.  AMI: Amazon Linux.
+5.  Instance type: t2.micro.
+6.  Select your key pair.
+7.  Network settings:
+    -   VPC: Default VPC
+    -   Auto-assign Public IP: Enable
+8.  Create or select a Security Group with these inbound rules:
+
+  Type         Port   Source
+  ------------ ------ ----------------------
+  SSH          22     My IP
+  HTTP         80     Anywhere (0.0.0.0/0)
+  Custom TCP   8080   Anywhere (0.0.0.0/0)
+
+9.  Launch the instance.
+
+------------------------------------------------------------------------
+
+Step 2: Launch EC2 Instance 2
+
+Repeat the same steps.
+
+-   Name: Linux-2
+-   Use the Default VPC
+-   Use the same Security Group.
+
+Now you have:
+
+-   Linux-1
+-   Linux-2
+
+------------------------------------------------------------------------
+
+Step 3: Connect to Linux-1
+
+    ssh -i key.pem ec2-user@Public-IP
+
+Update packages:
+
+    sudo yum update -y
+
+------------------------------------------------------------------------
+
+Step 4: Install Java
+
+    sudo yum install java-17-amazon-corretto -y
+
+Verify:
+
+    java -version
+
+------------------------------------------------------------------------
+
+Step 5: Install Tomcat
+
+    sudo yum install tomcat -y
+
+Enable and start:
+
+    sudo systemctl enable tomcat
+    sudo systemctl start tomcat
+
+Check:
+
+    systemctl status tomcat
+
+Open:
+
+    http://Public-IP:8080
+
+You should see the Tomcat page.
+
+------------------------------------------------------------------------
+
+Step 6: Install Apache
+
+    sudo yum install httpd -y
+
+Enable and start:
+
+    sudo systemctl enable httpd
+    sudo systemctl start httpd
+
+------------------------------------------------------------------------
+
+Step 7: Configure Apache as a Reverse Proxy
+
+Edit:
+
+    sudo vi /etc/httpd/conf/httpd.conf
+
+Add the following at the end of the file:
+
+    LoadModule proxy_module modules/mod_proxy.so
+    LoadModule proxy_http_module modules/mod_proxy_http.so
+
+    ProxyPreserveHost On
+
+    ProxyPass / http://localhost:8080/
+    ProxyPassReverse / http://localhost:8080/
+
+Restart Apache:
+
+    sudo systemctl restart httpd
+
+Now browse:
+
+    http://Public-IP
+
+Apache should forward requests to Tomcat.
+
+------------------------------------------------------------------------
+
+Step 8: Create a Sample Application
+
+On Linux-1:
+
+    sudo mkdir -p /usr/share/tomcat/webapps/ROOT
+
+    sudo vi /usr/share/tomcat/webapps/ROOT/index.jsp
+
+Add:
+
+    <h1>This is Linux Server 1</h1>
+
+Restart Tomcat:
+
+    sudo systemctl restart tomcat
+
+On Linux-2:
+
+Create the same file but with:
+
+    <h1>This is Linux Server 2</h1>
+
+Restart Tomcat.
+
+------------------------------------------------------------------------
+
+Step 9: Create a Target Group
+
+1.  Go to EC2 → Target Groups.
+2.  Click Create target group.
+3.  Target type: Instances.
+4.  Protocol: HTTP.
+5.  Port: 80.
+6.  VPC: Default VPC.
+7.  Health check path:
+
+    /
+
+8.  Register:
+    -   Linux-1
+    -   Linux-2
+9.  Wait until both instances show Healthy.
+
+------------------------------------------------------------------------
+
+Step 10: Create an Application Load Balancer
+
+1.  Go to EC2 → Load Balancers.
+2.  Click Create Load Balancer.
+3.  Choose Application Load Balancer.
+4.  Name:
+
+    Apache-Tomcat-ALB
+
+5.  Scheme:
+
+    Internet-facing
+
+6.  IP type:
+
+    IPv4
+
+7.  VPC:
+
+    Default VPC
+
+8.  Select at least two Availability Zones (choose the default public
+    subnets).
+
+9.  Create or use a Security Group allowing:
+
+    -   HTTP (80) from 0.0.0.0/0
+
+10. Listener:
+
+    -   HTTP : 80
+
+11. Forward to the target group you created.
+
+12. Click Create Load Balancer.
+
+------------------------------------------------------------------------
+
+Step 11: Test the Load Balancer
+
+Copy the ALB DNS name, for example:
+
+    http://your-alb-dns-name
+
+Refresh the page multiple times. The ALB will distribute requests
+between Linux-1 and Linux-2.
+
+------------------------------------------------------------------------
+
+Step 12: Test Failover
+
+On Linux-1, stop Apache:
+
+    sudo systemctl stop httpd
+
+or stop Tomcat:
+
+    sudo systemctl stop tomcat
+
+After a short time, the ALB health checks will mark Linux-1 as
+Unhealthy.
+
+Now all traffic will automatically go to Linux-2.
+
+To restore Linux-1:
+
+    sudo systemctl start httpd
+    sudo systemctl start tomcat
+
+Once the health checks pass again, the ALB will automatically include
+Linux-1 in load balancing.
+
+------------------------------------------------------------------------
+
+Final Flow
+
+    User
+      |
+      v
+    Application Load Balancer
+      |
+      +---- Linux-1 (Apache → Tomcat)
+      |
+      +---- Linux-2 (Apache → Tomcat)
+
+    If Linux-1 fails:
+    User
+      |
+      v
+    Application Load Balancer
+      |
+      +---- Linux-2 only
+
+    When Linux-1 recovers:
+    Application Load Balancer
+      |
+      +---- Linux-1
+      |
+      +---- Linux-2
